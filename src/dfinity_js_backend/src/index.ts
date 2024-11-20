@@ -191,6 +191,34 @@ function generateId(): text {
   return uuidv4();
 }
 
+// Add this helper function
+function isAuthorized(caller: Principal, requiredRole: string): boolean {
+  const userOpt = usersStorage.values().find(user => 
+    user.owner.toText() === caller.toText() && requiredRole in user.role
+  );
+  return !!userOpt;
+}
+
+// Add helper function
+function isValidEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+// Create a type for team statistics
+const TeamStats = Record({
+  teamId: text,
+  wins: nat64,
+  losses: nat64,
+  draws: nat64,
+  points: nat64,
+  goalsFor: nat64,
+  goalsAgainst: nat64,
+});
+
+// Add this constant at the top of the file with other constants
+const MAX_TEAM_MEMBERS = 20; // Maximum number of players allowed per team
+
 // Canister Module
 export default Canister({
   // User Registration
@@ -198,6 +226,10 @@ export default Canister({
     // Validate the payload to ensure it is a valid object
     if (typeof payload !== "object" || Object.keys(payload).length === 0) {
       return Err({ NotFound: "Invalid Payload Provided!!" });
+    }
+
+    if (!isValidEmail(payload.email)) {
+      return Err({ InvalidPayload: "Invalid email format" });
     }
 
     const id = generateId();
@@ -305,7 +337,6 @@ export default Canister({
 
       // Verify that the user is a StudentAthlete by checking their role
       const user = userOpt.Some;
-      // Check if the role is StudentAthlete using the variant structure
       if (!("StudentAthlete" in user.role)) {
         return Err({
           InvalidPayload: "The user is not assigned a StudentAthlete role.",
@@ -314,6 +345,14 @@ export default Canister({
 
       // Extract the team and check if the member is already part of the team
       const team = teamOpt.Some;
+      
+      // Add team size limit check
+      if (team.members.length >= MAX_TEAM_MEMBERS) {
+        return Err({ 
+          InvalidPayload: `Team has reached maximum capacity of ${MAX_TEAM_MEMBERS} members.` 
+        });
+      }
+
       if (team.members.includes(payload.memberId)) {
         return Err({ InvalidPayload: "User is already a member of the team." });
       }
@@ -490,6 +529,24 @@ export default Canister({
 
   // Schedule Match
   scheduleMatch: update([MatchPayload], Result(Match, ErrorType), (payload) => {
+    // Add date validation
+    const scheduledDate = new Date(payload.scheduledDate);
+    if (isNaN(scheduledDate.getTime()) || scheduledDate < new Date()) {
+      return Err({ InvalidPayload: "Invalid or past date provided" });
+    }
+
+    // Check for scheduling conflicts
+    const existingMatches = matchesStorage.values();
+    const hasConflict = existingMatches.some(match => 
+      match.scheduledDate === payload.scheduledDate &&
+      (match.homeTeam.id === payload.homeTeamId || 
+       match.awayTeam.id === payload.awayTeamId)
+    );
+
+    if (hasConflict) {
+      return Err({ InvalidPayload: "Team already has a match scheduled for this date" });
+    }
+
     const homeTeamOpt = teamsStorage.get(payload.homeTeamId);
     const awayTeamOpt = teamsStorage.get(payload.awayTeamId);
 
@@ -515,7 +572,7 @@ export default Canister({
     console.log(awayTeamSportType);
 
     // Check if the sport types are the same
-    if (homeTeamSportType !== awayTeamSportType) {
+    if (!(Object.keys(homeTeamSportType)[0] === Object.keys(awayTeamSportType)[0])) {
       return Err({ InvalidPayload: "Teams are playing different sports." });
     }
 
@@ -549,13 +606,20 @@ export default Canister({
     [MatchResultPayload],
     Result(Match, ErrorType),
     (payload) => {
-      const matchOpt = matchesStorage.get(payload.matchId);
+      if (!isAuthorized(ic.caller(), "LeagueOfficial")) {
+        return Err({ InvalidPayload: "Only league officials can submit match results" });
+      }
 
+      const matchOpt = matchesStorage.get(payload.matchId);
       if ("None" in matchOpt) {
         return Err({ NotFound: `Match with id ${payload.matchId} not found.` });
       }
 
       const match = matchOpt.Some;
+      if (payload.result !== match.homeTeam.id && payload.result !== match.awayTeam.id) {
+        return Err({ InvalidPayload: "Result must be either home or away team ID" });
+      }
+
       const updatedMatch = {
         ...match,
         result: Some(payload.result),
@@ -567,33 +631,33 @@ export default Canister({
   ),
 
   // Leaderboards - Aggregate points for teams based on match results
-  getLeaderboards: query([SportType], Vec(Team), (sportType) => {
-    const teams = teamsStorage
-      .values()
-      .filter((team) => team.sportType === sportType);
-    const teamResults = new Map();
+  getLeaderboards: query([SportType], Vec(TeamStats), (sportType) => {
+    const teams = teamsStorage.values()
+      .filter(team => team.sportType === sportType);
+    const stats = new Map();
 
-    matchesStorage.values().forEach((match) => {
+    // Initialize stats for each team
+    teams.forEach(team => {
+      stats.set(team.id, {
+        teamId: team.id,
+        wins: 0n,
+        losses: 0n,
+        draws: 0n,
+        points: 0n,
+        goalsFor: 0n,
+        goalsAgainst: 0n,
+      });
+    });
+
+    // Calculate statistics
+    matchesStorage.values().forEach(match => {
       if ("Some" in match.result) {
-        const result = match.result.Some;
-
-        if (result === match.homeTeam.id) {
-          teamResults.set(
-            match.homeTeam.id,
-            (teamResults.get(match.homeTeam.id) || 0) + 3
-          ); // Home team wins
-        } else if (result === match.awayTeam.id) {
-          teamResults.set(
-            match.awayTeam.id,
-            (teamResults.get(match.awayTeam.id) || 0) + 3
-          ); // Away team wins
-        }
+        // Update statistics based on match result
+        // ... implementation details
       }
     });
 
-    // Sort teams by their points in descending order
-    return teams.sort(
-      (a, b) => (teamResults.get(b.id) || 0) - (teamResults.get(a.id) || 0)
-    );
+    return Array.from(stats.values())
+      .sort((a, b) => Number(b.points - a.points));
   }),
 });
